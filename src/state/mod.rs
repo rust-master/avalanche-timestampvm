@@ -1,3 +1,17 @@
+//! Manages the virtual machine states.
+
+use std::{
+    collections::HashMap,
+    io::{self, Error, ErrorKind},
+    sync::Arc,
+};
+
+use crate::block::Block;
+use avalanche_types::{choices, ids, subnet};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+/// Manages block and chain states for this Vm, both in-memory and persistent.
 #[derive(Clone)]
 pub struct State {
     pub db: Arc<RwLock<Box<dyn subnet::rpc::database::Database + Send + Sync>>>,
@@ -62,7 +76,7 @@ impl BlockWithStatus {
 }
 
 impl State {
-    /// Persists the last accepted block Id.
+    /// Persists the last accepted block Id to state.
     pub async fn set_last_accepted_block(&self, blk_id: &ids::Id) -> io::Result<()> {
         let mut db = self.db.write().await;
         db.put(LAST_ACCEPTED_BLOCK_KEY, &blk_id.to_vec())
@@ -87,7 +101,7 @@ impl State {
         }
     }
 
-    /// Returns the last accepted block Id.
+    /// Returns the last accepted block Id from state.
     pub async fn get_last_accepted_block_id(&self) -> io::Result<ids::Id> {
         let db = self.db.read().await;
         match db.get(LAST_ACCEPTED_BLOCK_KEY).await {
@@ -158,4 +172,52 @@ impl State {
 
         Ok(blk)
     }
+}
+
+/// RUST_LOG=debug cargo test --package timestampvm --lib -- state::test_state --exact --show-output
+#[tokio::test]
+async fn test_state() {
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .is_test(true)
+        .try_init();
+
+    let genesis_blk = Block::new(
+        ids::Id::empty(),
+        0,
+        random_manager::u64(),
+        random_manager::bytes(10).unwrap(),
+        choices::status::Status::Accepted,
+    )
+    .unwrap();
+    log::info!("genesis block: {genesis_blk}");
+
+    let blk1 = Block::new(
+        genesis_blk.id(),
+        1,
+        genesis_blk.timestamp() + 1,
+        random_manager::bytes(10).unwrap(),
+        choices::status::Status::Accepted,
+    )
+    .unwrap();
+    log::info!("blk1: {blk1}");
+
+    let mut state = State::default();
+    assert!(!state.has_last_accepted_block().await.unwrap());
+
+    state.write_block(&genesis_blk).await.unwrap();
+    assert!(!state.has_last_accepted_block().await.unwrap());
+
+    state.write_block(&blk1).await.unwrap();
+    state.set_last_accepted_block(&blk1.id()).await.unwrap();
+    assert!(state.has_last_accepted_block().await.unwrap());
+
+    let last_accepted_blk_id = state.get_last_accepted_block_id().await.unwrap();
+    assert_eq!(last_accepted_blk_id, blk1.id());
+
+    let read_blk = state.get_block(&genesis_blk.id()).await.unwrap();
+    assert_eq!(genesis_blk, read_blk);
+
+    let read_blk = state.get_block(&blk1.id()).await.unwrap();
+    assert_eq!(blk1, read_blk);
 }
